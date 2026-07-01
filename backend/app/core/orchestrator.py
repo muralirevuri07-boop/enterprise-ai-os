@@ -1,533 +1,392 @@
 from __future__ import annotations
 
-import sys
-from copy import deepcopy
-from datetime import datetime, timezone
-from pathlib import Path
-from threading import Lock
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Protocol, TypedDict
 from uuid import UUID
 
-try:
-    from app.agents.base import BaseAgent
-    from app.core.agent_bus import AgentBus
-    from app.core.conversation import MissionConversation
-    from app.core.message import AgentMessage, MessageType, Priority
-    from app.core.mission import Mission, MissionPriority, MissionStatus
-except ImportError:
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from agents.base import BaseAgent
-    from core.agent_bus import AgentBus
-    from core.conversation import MissionConversation
-    from core.message import AgentMessage, MessageType, Priority
-    from core.mission import Mission, MissionPriority, MissionStatus
+from .agent_bus import AgentBus
+from .conversation import MissionConversation
+from .message import AgentMessage, MessageType, Priority
+from .mission import Mission, MissionStatus
+
+
+class AgentProtocol(Protocol):
+    """Minimal agent interface required by the orchestrator."""
+
+    name: str
+
+    def execute(self, task: str) -> str:
+        ...
+
+
+class AgentResponse(TypedDict):
+    agent: str
+    task: str
+    output: str
+    message: AgentMessage
+    confidence: float
+
+
+@dataclass(frozen=True)
+class OrchestratorReport:
+    mission_id: UUID
+    final_decision: str
+    conflicts: List[Dict[str, Any]]
+    governance_feedback: Optional[str]
+    mission_summary: Dict[str, Any]
 
 
 class Orchestrator:
-    """Coordinate mission execution across registered specialist agents.
+    """Coordinate specialist agents to deliver executive mission recommendations."""
 
-    The orchestrator acts as the CEO coordinator only: it creates missions,
-    selects eligible agents, dispatches task messages through ``AgentBus``,
-    observes responses addressed to ``CEO``, runs a governance review, and
-    publishes a final CEO decision. Specialist work remains inside registered
-    ``BaseAgent`` instances.
-    """
+    def __init__(self, agent_bus: AgentBus, registered_agents: Optional[Dict[str, AgentProtocol]] = None) -> None:
+        self.agent_bus = agent_bus
+        self._registered_agents: Dict[str, AgentProtocol] = {}
+        # observed messages for monitoring (not used to relay messages)
+        self._observed_messages: List[AgentMessage] = []
+        # register as an observer to the bus so the orchestrator can watch activity
+        try:
+            self.agent_bus.register_observer(self._on_message)
+        except Exception:
+            pass
+        if registered_agents:
+            for agent in registered_agents.values():
+                self.register_agent(agent)
 
-    CEO_NAME = "CEO"
-
-    def __init__(self) -> None:
-        """Create an orchestrator with an initial control conversation.
-
-        ``create_mission`` replaces the control conversation with a mission
-        conversation before execution. Keeping an initial bus allows agents to
-        be registered before the first mission is created; they are rebound to
-        the active mission bus whenever a new mission is created.
-        """
-        control_mission = Mission(
-            title="Orchestrator control mission",
-            objective="Coordinate mission setup before a business mission is created.",
-        )
-        self._conversation: MissionConversation = MissionConversation.from_mission(control_mission)
-        self._bus: AgentBus = AgentBus(self._conversation)
-        self._agents: dict[str, BaseAgent] = {}
-        self._active_missions: dict[UUID, Mission] = {}
-        self._ceo_inbox: list[AgentMessage] = []
-        self._lock: Lock = Lock()
-        self._register_ceo_listener()
-
-    @property
-    def bus(self) -> AgentBus:
-        """Return the currently active mission bus."""
-        return self._bus
-
-    @property
-    def conversation(self) -> MissionConversation:
-        """Return the currently active mission conversation."""
-        return self._conversation
-
-    def register_agent(self, agent: BaseAgent) -> None:
-        """Register a specialist agent with the active bus.
-
-        Registration is keyed by ``agent.name``. The agent is also bound to the
-        active bus so its ``receive`` and ``send`` methods validate against the
-        current mission context.
-        """
-        if not self._is_agent_like(agent):
-            raise TypeError("agent must provide the BaseAgent interface")
-        name = self._normalize_name(agent.name)
-        if name == self.CEO_NAME:
-            raise ValueError("CEO is reserved for the orchestrator coordinator")
-
-        with self._lock:
-            if name in self._agents:
-                raise ValueError(f"agent already registered: {name}")
-            self._agents[name] = agent
-            self._bind_agent_to_active_bus(agent)
+    def register_agent(self, agent: AgentProtocol) -> None:
+        """Register an agent instance by name for future mission coordination."""
+        name = agent.name.strip()
+        if not name:
+            raise ValueError("agent.name must be a non-empty string")
+        if name in self._registered_agents:
+            raise ValueError(f"agent '{name}' is already registered")
+        self._registered_agents[name] = agent
+        # If the agent supports attaching to the AgentBus, attach it so it can receive messages
+        try:
+            attach = getattr(agent, "attach_to_bus", None)
+            if callable(attach):
+                attach(self.agent_bus)
+        except Exception:
+            # attachment failure should not block registration
+            pass
 
     def unregister_agent(self, name: str) -> None:
-        """Unregister an agent by name.
+        """Unregister a previously registered agent."""
+        normalized = name.strip()
+        if normalized not in self._registered_agents:
+            raise KeyError(f"agent '{normalized}' is not registered")
+        self._registered_agents.pop(normalized)
 
-        Removing an unknown agent is treated as an idempotent no-op so shutdown
-        and test cleanup code can call this method safely.
-        """
-        normalized_name = self._normalize_name(name)
-        with self._lock:
-            self._agents.pop(normalized_name, None)
-            self._bus.unregister(normalized_name)
+    def available_agents(self) -> List[str]:
+        """Return the list of currently registered agent names."""
+        return sorted(self._registered_agents.keys())
 
-    def available_agents(self) -> list[str]:
-        """Return registered specialist agent names in deterministic order."""
-        with self._lock:
-            return sorted(self._agents)
+    def create_execution_plan(self, mission: Mission) -> Dict[str, str]:
+        """Create a mission execution plan that assigns tasks to specialist agents."""
+        if not self._registered_agents:
+            raise RuntimeError("No agents are registered with the orchestrator")
 
-    def create_mission(
-        self,
-        title: str,
-        objective: str,
-        priority: MissionPriority | str = MissionPriority.MEDIUM,
-    ) -> Mission:
-        """Create and activate a new mission.
+        if mission.assigned_agents:
+            agent_candidates = [agent for agent in mission.assigned_agents if agent in self._registered_agents]
+        else:
+            agent_candidates = [
+                name
+                for name in ("Research", "Finance", "Governance")
+                if name in self._registered_agents
+            ]
+            if not agent_candidates:
+                agent_candidates = list(self._registered_agents.keys())
 
-        A fresh ``MissionConversation`` and ``AgentBus`` are created for the
-        mission, the CEO listener is registered, and all existing agents are
-        rebound to the new bus.
-        """
-        normalized_priority = self._coerce_priority(priority)
-        mission = Mission(title=title, objective=objective, priority=normalized_priority)
+        if mission.priority in {"HIGH", "CRITICAL"} and "Governance" in self._registered_agents:
+            if "Governance" not in agent_candidates:
+                agent_candidates.append("Governance")
 
-        with self._lock:
-            self._active_missions[mission.id] = mission
-            self._conversation = MissionConversation.from_mission(mission)
-            self._conversation.start()
-            self._bus = AgentBus(self._conversation)
-            self._ceo_inbox.clear()
-            self._register_ceo_listener()
-            for agent in self._agents.values():
-                self._bind_agent_to_active_bus(agent)
+        plan: Dict[str, str] = {}
+        for agent_name in agent_candidates:
+            if agent_name == "Research":
+                plan[agent_name] = (
+                    f"Research the mission objective and collect evidence relevant to: {mission.objective}"
+                )
+            elif agent_name == "Finance":
+                plan[agent_name] = (
+                    f"Analyze the financial implications of the mission objective: {mission.objective}"
+                )
+            elif agent_name == "Governance":
+                plan[agent_name] = (
+                    "Review the mission objective, specialist outputs, and any detected conflicts for governance compliance "
+                    "and executive readiness."
+                )
+            else:
+                plan[agent_name] = f"Support the mission objective with a specialist response for: {mission.objective}"
 
-        return mission
+        return plan
 
-    def assign_agents(self, mission: Mission) -> None:
-        """Select eligible agents for a mission using ``can_handle``.
+    def assign_tasks(self, mission: Mission) -> Dict[str, str]:
+        """Assign task messages to the agents selected for the mission."""
+        plan = self.create_execution_plan(mission)
+        conversation = MissionConversation(mission.conversation_id, self.agent_bus)
 
-        Eligible agents are added to ``mission.assigned_agents`` and the mission
-        moves to ``PLANNING``. At least one eligible specialist is required.
-        """
-        self._ensure_active_mission(mission)
+        if not conversation.history():
+            conversation.start()
 
-        eligible_agents: list[str] = []
-        with self._lock:
-            agents = list(self._agents.values())
+        for agent_name, task in plan.items():
+            conversation.send(
+                sender="CEO",
+                receiver=agent_name,
+                message_type=MessageType.TASK,
+                content=task,
+                priority=Priority.HIGH,
+            )
 
-        for agent in agents:
-            if agent.can_handle(mission):
-                eligible_agents.append(agent.name)
+        mission.assign_agents(list(plan.keys()))
+        mission.update_status(MissionStatus.ASSIGNED)
+        mission.metadata["execution_plan"] = plan
+        return plan
 
-        if not eligible_agents:
-            raise RuntimeError("no registered agents can handle this mission")
-
-        mission.assign_agents(eligible_agents)
+    def execute_mission(self, mission: Mission) -> OrchestratorReport:
+        """Execute the full orchestrator flow for a mission."""
         mission.update_status(MissionStatus.PLANNING)
+        conversation = MissionConversation(mission.conversation_id, self.agent_bus)
+        if not conversation.history():
+            conversation.start()
 
-    def execute(self, mission: Mission) -> dict[str, Any]:
-        """Run the full CEO-coordinated mission workflow.
+        self.assign_tasks(mission)
+        mission.update_status(MissionStatus.IN_PROGRESS)
 
-        The flow assigns eligible agents, sends task messages, collects
-        responses, detects conflicts, completes governance review, finalizes a
-        CEO decision, and marks the mission completed.
-        """
-        self._ensure_active_mission(mission)
-        if not mission.assigned_agents:
-            self.assign_agents(mission)
+        responses = self.collect_responses(mission)
+        conflicts = self.detect_conflicts(responses)
 
-        mission.update_status(MissionStatus.RUNNING)
+        governance_feedback: Optional[str] = None
+        if conflicts:
+            governance_feedback = self.request_governance_review(mission)
 
-        for agent_name in mission.assigned_agents:
-            self.dispatch(
-                AgentMessage(
-                    mission_id=mission.id,
-                    sender=self.CEO_NAME,
-                    receiver=agent_name,
-                    message_type=MessageType.TASK,
-                    priority=Priority.HIGH,
-                    content=self._task_content_for(mission, agent_name),
-                    requires_response=True,
+        final_decision = self.make_final_decision(mission, responses, conflicts, governance_feedback)
+        summary = self.complete_mission(mission, final_decision=final_decision)
+
+        return OrchestratorReport(
+            mission_id=mission.id,
+            final_decision=final_decision,
+            conflicts=conflicts,
+            governance_feedback=governance_feedback,
+            mission_summary=summary,
+        )
+
+    def collect_responses(self, mission: Mission) -> List[AgentResponse]:
+        """Collect specialist agent responses and publish them to the mission conversation."""
+        plan = mission.metadata.get("execution_plan")
+        if not plan or not isinstance(plan, dict):
+            plan = self.create_execution_plan(mission)
+
+        conversation = MissionConversation(mission.conversation_id, self.agent_bus)
+        responses: List[AgentResponse] = []
+
+        for agent_name, task in plan.items():
+            agent = self._registered_agents.get(agent_name)
+            if agent is None:
+                continue
+
+            output = agent.execute(task)
+            response_message = conversation.send(
+                sender=agent_name,
+                receiver="CEO",
+                message_type=MessageType.RESPONSE,
+                content=output,
+                priority=Priority.MEDIUM,
+                confidence=1.0,
+            )
+            responses.append(
+                AgentResponse(
+                    agent=agent_name,
+                    task=task,
+                    output=output,
+                    message=response_message,
+                    confidence=response_message.confidence,
                 )
             )
 
-        responses = self.collect_responses(mission)
-        conflicts = self.detect_conflicts(mission)
-        governance = self.governance_review(mission)
-        decision = self.finalize(mission)
-        self.complete(mission)
+        return responses
 
-        return {
-            "mission": mission.to_dict(),
-            "responses": [message.to_dict() for message in responses],
-            "conflicts": conflicts,
-            "governance_review": governance.to_dict() if governance is not None else None,
-            "decision": decision.to_dict(),
-            "conversation": self._conversation.export_json(),
+    def detect_conflicts(self, responses: List[AgentResponse]) -> List[Dict[str, Any]]:
+        """Detect potential conflicts between specialist responses."""
+        conflicts: List[Dict[str, Any]] = []
+        patterns = [
+            ("recommend", "do not recommend"),
+            ("approve", "reject"),
+            ("low risk", "high risk"),
+            ("strong opportunity", "significant risk"),
+        ]
+
+        normalized: Dict[str, str] = {
+            response["agent"]: response["output"].strip().lower() for response in responses
         }
 
-    def dispatch(self, message: AgentMessage) -> AgentMessage | None:
-        """Send a message through the active bus."""
-        if message.mission_id != self._conversation.mission_id:
-            raise ValueError("message mission_id does not match the active conversation")
-        return self._bus.send(message)
-
-    def collect_responses(self, mission: Mission) -> list[AgentMessage]:
-        """Collect all responses addressed to CEO for a mission."""
-        self._ensure_active_mission(mission)
-        with self._lock:
-            return deepcopy(
-                [
-                    message
-                    for message in self._ceo_inbox
-                    if message.mission_id == mission.id
-                    and getattr(message.message_type, "value", message.message_type)
-                    in {
-                        MessageType.RESPONSE.value,
-                        MessageType.ANSWER.value,
-                        MessageType.EVIDENCE.value,
-                        MessageType.APPROVAL.value,
-                    }
-                ]
-            )
-
-    def detect_conflicts(self, mission: Mission) -> list[dict[str, Any]]:
-        """Detect high-level disagreements in collected agent responses.
-
-        The detector compares simple decision signals across responses. It is
-        intentionally conservative: it reports clear approve/reject,
-        proceed/do-not-proceed, and low-risk/high-risk disagreements without
-        inventing domain conclusions.
-        """
-        responses = self.collect_responses(mission)
-        conflicts: list[dict[str, Any]] = []
-        signal_pairs = (
-            ("approve", "reject"),
-            ("proceed", "do not proceed"),
-            ("recommend", "do not recommend"),
-            ("low risk", "high risk"),
-            ("viable", "not viable"),
-        )
-
-        for index, first in enumerate(responses):
-            first_text = first.content.lower()
-            for second in responses[index + 1 :]:
-                second_text = second.content.lower()
-                for positive, negative in signal_pairs:
-                    opposing = (
-                        positive in first_text
-                        and negative in second_text
-                        or negative in first_text
-                        and positive in second_text
-                    )
-                    if opposing:
+        for i, first in enumerate(responses):
+            for second in responses[i + 1 :]:
+                first_text = normalized[first["agent"]]
+                second_text = normalized[second["agent"]]
+                for positive, negative in patterns:
+                    if positive in first_text and negative in second_text:
                         conflicts.append(
                             {
-                                "agents": [first.sender, second.sender],
-                                "signal_pair": [positive, negative],
-                                "severity": "high",
-                                "first_message_id": str(first.id),
-                                "second_message_id": str(second.id),
+                                "agents": [first["agent"], second["agent"]],
+                                "topic": "recommendation disagreement",
+                                "positions": {first["agent"]: first["output"], second["agent"]: second["output"]},
+                                "severity": "HIGH",
+                            }
+                        )
+                        break
+                    if negative in first_text and positive in second_text:
+                        conflicts.append(
+                            {
+                                "agents": [first["agent"], second["agent"]],
+                                "topic": "recommendation disagreement",
+                                "positions": {first["agent"]: first["output"], second["agent"]: second["output"]},
+                                "severity": "HIGH",
                             }
                         )
                         break
 
         return conflicts
 
-    def governance_review(self, mission: Mission) -> AgentMessage | None:
-        """Run governance review before CEO finalization.
-
-        A governance-capable agent is selected by capability metadata rather
-        than by a hardcoded agent name. If no such agent exists, execution fails
-        because the mission contract requires governance review before a final
-        decision.
-        """
-        self._ensure_active_mission(mission)
-        governance_agent = self._select_governance_agent(mission)
+    def request_governance_review(self, mission: Mission) -> Optional[str]:
+        """Request a governance review when specialist responses conflict."""
+        governance_agent = self._registered_agents.get("Governance")
         if governance_agent is None:
-            raise RuntimeError("no governance-capable agent is registered")
+            mission.update_status(MissionStatus.CEO_REVIEW)
+            return None
 
-        mission.update_status(MissionStatus.REVIEW)
-        before_ids = {message.id for message in self.collect_responses(mission)}
-        self.dispatch(
-            AgentMessage(
-                mission_id=mission.id,
-                sender=self.CEO_NAME,
-                receiver=governance_agent.name,
-                message_type=MessageType.TASK,
-                priority=Priority.CRITICAL,
-                content=self._governance_task_content(mission),
-                requires_response=True,
-            )
+        conversation = MissionConversation(mission.conversation_id, self.agent_bus)
+        mission.update_status(MissionStatus.GOVERNANCE_REVIEW)
+
+        task = (
+            "Review the mission objective and the specialist responses. Identify governance risks, "
+            "compliance issues, and whether the mission is ready for executive recommendation."
         )
-
-        after_responses = self.collect_responses(mission)
-        for message in reversed(after_responses):
-            if message.id not in before_ids and message.sender == governance_agent.name:
-                return message
-        return None
-
-    def finalize(self, mission: Mission) -> AgentMessage:
-        """Produce and store the CEO final decision message."""
-        self._ensure_active_mission(mission)
-        responses = self.collect_responses(mission)
-        conflicts = self.detect_conflicts(mission)
-
-        response_lines = [
-            f"{message.sender}: {message.content}" for message in responses
-        ]
-        conflict_text = (
-            f"{len(conflicts)} conflict(s) detected and considered."
-            if conflicts
-            else "No material response conflicts detected."
-        )
-        content = (
-            f"CEO Decision for mission '{mission.title}': proceed to deeper diligence. "
-            f"{conflict_text} Inputs reviewed: {' | '.join(response_lines)}"
-        )
-
-        decision = AgentMessage(
-            mission_id=mission.id,
-            sender=self.CEO_NAME,
-            receiver=self.CEO_NAME,
-            message_type=MessageType.DECISION,
+        conversation.send(
+            sender="CEO",
+            receiver="Governance",
+            message_type=MessageType.TASK,
+            content=task,
             priority=Priority.CRITICAL,
-            content=content,
-            confidence=0.9 if not conflicts else 0.75,
         )
-        self.dispatch(decision)
-        return decision
 
-    def complete(self, mission: Mission) -> None:
-        """Mark a mission completed after final decision publication."""
-        self._ensure_active_mission(mission)
-        for agent_name in mission.assigned_agents:
-            mission.complete_agent(agent_name)
-        mission.update_status(MissionStatus.COMPLETED)
+        output = governance_agent.execute(task)
+        conversation.send(
+            sender="Governance",
+            receiver="CEO",
+            message_type=MessageType.RESPONSE,
+            content=output,
+            priority=Priority.MEDIUM,
+        )
 
-    def mission_status(self, mission_id: UUID) -> dict[str, Any] | None:
-        """Return JSON-safe status for a known mission."""
-        with self._lock:
-            mission = self._active_missions.get(mission_id)
-            if mission is None:
-                return None
-            conversation_summary = (
-                self._conversation.summary()
-                if self._conversation.mission_id == mission_id
-                else None
+        mission.governance_status = "reviewed"
+        mission.add_evidence(f"Governance review completed by Governance agent.")
+        return output
+
+    def make_final_decision(
+        self,
+        mission: Mission,
+        responses: List[AgentResponse],
+        conflicts: List[Dict[str, Any]],
+        governance_feedback: Optional[str] = None,
+    ) -> str:
+        """Produce an executive recommendation without performing specialist work."""
+        lines: List[str] = [
+            "The orchestrator has coordinated specialist agents and produced an executive recommendation.",
+            f"Mission objective: {mission.objective}",
+        ]
+
+        if conflicts:
+            lines.append(
+                "Conflicts were detected between specialist agents and escalated for governance review."
             )
-            return {
-                "mission": mission.to_dict(),
-                "conversation": conversation_summary,
-                "available_agents": sorted(self._agents),
-                "reported_at": datetime.now(timezone.utc).isoformat(),
-            }
+        else:
+            lines.append("Specialist inputs are aligned and do not require additional conflict resolution.")
 
-    def reset(self) -> None:
-        """Clear active missions, conversation history, and agent state."""
-        with self._lock:
-            self._active_missions.clear()
-            self._ceo_inbox.clear()
-            self._conversation.clear()
-            self._bus.clear()
-            for agent in self._agents.values():
-                agent.reset()
+        if governance_feedback:
+            lines.append(f"Governance review conclusion: {governance_feedback}")
+            mission.update_status(MissionStatus.CEO_REVIEW)
+        else:
+            mission.update_status(MissionStatus.CEO_REVIEW)
+            lines.append("Executive recommendation is based on available specialist responses.")
 
-    def _register_ceo_listener(self) -> None:
-        """Register the CEO coordinator listener on the active bus."""
-        self._bus.register(self.CEO_NAME, self._receive_as_ceo)
+        lines.append("Proceed with the mission under CEO oversight and update governance controls as required.")
+        return " ".join(lines)
 
-    def _receive_as_ceo(self, message: AgentMessage) -> AgentMessage | None:
-        """Store messages addressed to CEO without creating more work."""
-        with self._lock:
-            self._ceo_inbox.append(deepcopy(message))
-        return None
-
-    def _bind_agent_to_active_bus(self, agent: BaseAgent) -> None:
-        """Bind an agent callback to the active bus."""
-        setattr(agent, "_bus", self._bus)
-        self._bus.register(agent.name, agent.receive)
-
-    def _ensure_active_mission(self, mission: Mission) -> None:
-        """Validate that ``mission`` is known and backed by the active bus."""
-        with self._lock:
-            if mission.id not in self._active_missions:
-                self._active_missions[mission.id] = mission
-            if self._conversation.mission_id != mission.id:
-                self._conversation = MissionConversation.from_mission(mission)
-                self._conversation.start()
-                self._bus = AgentBus(self._conversation)
-                self._ceo_inbox.clear()
-                self._register_ceo_listener()
-                for agent in self._agents.values():
-                    self._bind_agent_to_active_bus(agent)
-
-    def _select_governance_agent(self, mission: Mission) -> BaseAgent | None:
-        """Return the first registered governance-capable agent."""
-        with self._lock:
-            agents = list(self._agents.values())
-        for agent in agents:
-            capability_text = f"{agent.name} {agent.role} {agent.description}".lower()
-            if "governance" in capability_text and agent.can_handle(mission):
-                return agent
-        for agent in agents:
-            capability_text = f"{agent.name} {agent.role} {agent.description}".lower()
-            if "governance" in capability_text:
-                return agent
-        return None
-
-    def _task_content_for(self, mission: Mission, agent_name: str) -> str:
-        """Build a CEO task for an assigned agent."""
-        return (
-            f"Mission: {mission.title}\n"
-            f"Objective: {mission.objective}\n"
-            f"Assigned specialist: {agent_name}\n"
-            "Provide a concise response with recommendation, risks, and confidence."
+    def complete_mission(
+        self,
+        mission: Mission,
+        final_decision: str,
+        confidence: float = 0.85,
+    ) -> Dict[str, Any]:
+        """Mark the mission complete and publish the final executive recommendation."""
+        conversation = MissionConversation(mission.conversation_id, self.agent_bus)
+        conversation.send(
+            sender="CEO",
+            receiver="Mission",
+            message_type=MessageType.DECISION,
+            content=final_decision,
+            priority=Priority.CRITICAL,
+            confidence=confidence,
         )
 
-    def _governance_task_content(self, mission: Mission) -> str:
-        """Build the governance review task from collected mission context."""
-        responses = self.collect_responses(mission)
-        conflicts = self.detect_conflicts(mission)
-        response_summary = " | ".join(f"{message.sender}: {message.content}" for message in responses)
-        return (
-            f"Review mission governance readiness for: {mission.objective}. "
-            f"Responses: {response_summary or 'No prior specialist responses.'} "
-            f"Detected conflicts: {conflicts or 'none'}."
-        )
+        mission.complete(final_decision=final_decision, confidence=confidence)
+        return mission.summary()
 
-    @staticmethod
-    def _coerce_priority(priority: MissionPriority | str) -> MissionPriority:
-        """Normalize a mission priority value."""
-        if isinstance(priority, MissionPriority):
-            return priority
-        normalized = priority.strip().lower()
-        for candidate in MissionPriority:
-            if normalized in {candidate.value, candidate.name.lower()}:
-                return candidate
-        raise ValueError(f"unknown mission priority: {priority}")
+    def _on_message(self, message: AgentMessage) -> None:
+        """Observer callback invoked for every message on the AgentBus.
 
-    @staticmethod
-    def _normalize_name(name: str) -> str:
-        """Return a stripped non-empty name."""
-        normalized = name.strip()
-        if not normalized:
-            raise ValueError("name must be a non-empty string")
-        return normalized
-
-    @staticmethod
-    def _is_agent_like(agent: object) -> bool:
-        """Return whether an object provides the required agent interface."""
-        return all(
-            hasattr(agent, attribute)
-            for attribute in ("name", "role", "description", "can_handle", "receive", "reset")
-        )
+        The orchestrator should not relay or intercept messages; it only observes.
+        """
+        try:
+            self._observed_messages.append(message)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    class DemoAgent(BaseAgent):
-        """Small deterministic agent used by the orchestrator example."""
+    from uuid import uuid4
 
-        def __init__(
-            self,
-            name: str,
-            role: str,
-            description: str,
-            bus: AgentBus,
-            response: str,
-        ) -> None:
-            super().__init__(name=name, role=role, description=description, bus=bus)
-            self._response = response
-            self._started = False
+    class SimpleAgent:
+        def __init__(self, name: str, executor: Any) -> None:
+            self.name = name
+            self._executor = executor
 
-        def initialize(self) -> None:
-            self._started = True
+        def execute(self, task: str) -> str:
+            return self._executor(task)
 
-        def can_handle(self, mission: Mission) -> bool:
-            return self.name in mission.assigned_agents or self.role.lower().split()[0] in mission.objective.lower()
+    def research_executor(task: str) -> str:
+        return (
+            "Research findings indicate that several European AI startups are strategically "
+            "positioned for acquisition, with differentiated product roadmaps and strong domain expertise."
+        )
 
-        def handle_task(self, message: AgentMessage) -> AgentMessage | None:
-            return AgentMessage(
-                mission_id=message.mission_id,
-                sender=self.name,
-                receiver=Orchestrator.CEO_NAME,
-                message_type=MessageType.RESPONSE,
-                priority=Priority.MEDIUM,
-                content=self._response,
-                confidence=0.86,
-                parent_message_id=message.id,
-            )
+    def finance_executor(task: str) -> str:
+        return (
+            "Finance analysis identifies moderate acquisition risk, recommends continued diligence, "
+            "and highlights revenue multiple pressure in the current funding environment."
+        )
 
-        def review(self, message: AgentMessage) -> AgentMessage | None:
-            return None
+    def governance_executor(task: str) -> str:
+        return (
+            "Governance review confirms the mission can proceed with executive oversight, "
+            "but requires a formal risk mitigation plan before final approval."
+        )
 
-        def health(self) -> dict[str, Any]:
-            return {"name": self.name, "status": "healthy" if self._started else "initializing"}
-
-        def shutdown(self) -> None:
-            self._started = False
-
-    orchestrator = Orchestrator()
-    mission = orchestrator.create_mission(
+    mission = Mission(
         title="Research AI startups in Europe for acquisition.",
-        objective="Research AI startups in Europe for acquisition with finance and governance review.",
-        priority=MissionPriority.HIGH,
+        objective="Identify high-potential AI startups in Europe that align with our strategic acquisition criteria.",
+        created_by="CEO",
     )
 
-    research = DemoAgent(
-        name="Research",
-        role="Research Specialist",
-        description="Researches markets and acquisition targets.",
-        bus=orchestrator.bus,
-        response="Recommend proceeding: several European AI startups match strategic acquisition criteria.",
-    )
-    finance = DemoAgent(
-        name="Finance",
-        role="Finance Specialist",
-        description="Reviews financial viability and acquisition economics.",
-        bus=orchestrator.bus,
-        response="Proceed with caution: valuation ranges are acceptable if diligence confirms revenue durability.",
-    )
-    governance = DemoAgent(
-        name="Governance",
-        role="Governance Reviewer",
-        description="Reviews governance, compliance, and executive decision readiness.",
-        bus=orchestrator.bus,
-        response="Governance approves deeper diligence with documented risk controls and board reporting.",
-    )
+    bus = AgentBus()
+    orchestrator = Orchestrator(agent_bus=bus)
+    orchestrator.register_agent(SimpleAgent("Research", research_executor))
+    orchestrator.register_agent(SimpleAgent("Finance", finance_executor))
+    orchestrator.register_agent(SimpleAgent("Governance", governance_executor))
 
-    for demo_agent in (research, finance, governance):
-        demo_agent.initialize()
-        orchestrator.register_agent(demo_agent)
-
-    report = orchestrator.execute(mission)
-
-    print("Mission status:", orchestrator.mission_status(mission.id))
-    print("Decision:", report["decision"]["content"])
-    print("Flow:")
-    for message in orchestrator.conversation.history():
-        print(message.summary())
+    report = orchestrator.execute_mission(mission)
+    print("Mission summary:", report.mission_summary)
+    print("Final decision:\n", report.final_decision)
+    print("Conflicts detected:", report.conflicts)
+    print("Governance feedback:\n", report.governance_feedback)

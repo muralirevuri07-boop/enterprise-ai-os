@@ -1,277 +1,239 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from collections import defaultdict
-from copy import deepcopy
+from bisect import bisect_right
 from threading import Lock
-from typing import Callable
-from uuid import UUID
+from typing import Dict, List
+from uuid import UUID, uuid4
 
-try:
-    from .conversation import MissionConversation
-    from .message import AgentMessage, MessageType, Priority
-    from .mission import Mission
-except ImportError:
-    from conversation import MissionConversation
-    from message import AgentMessage, MessageType, Priority
-    from mission import Mission
-
-
-AgentCallback = Callable[[AgentMessage], AgentMessage | None]
+from app.core.message import AgentMessage, MessageType, Priority
 
 
 class AgentBus:
-    """Thread-safe direct message bus for a mission conversation.
+    """Thread-safe internal bus for agent-to-agent communication.
 
-    ``AgentBus`` coordinates synchronous agent-to-agent dispatch for one
-    ``MissionConversation``. Every accepted message is validated, deep-copied,
-    stored chronologically, and delivered to the registered listener whose name
-    matches the message receiver. If a listener returns a response message, the
-    bus dispatches that response immediately, allowing simple agent workflows to
-    chain while still enforcing duplicate-message and maximum-depth protections.
+    The AgentBus stores messages grouped by mission_id and preserves the
+    chronological ordering of every mission conversation. It supports multiple
+    concurrent missions and provides query methods for mission and agent
+    interactions while protecting stored messages from accidental mutation.
     """
 
-    def __init__(self, conversation: MissionConversation, max_depth: int = 10) -> None:
-        """Create a bus for ``conversation``.
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._conversations: Dict[UUID, List[AgentMessage]] = {}
+        self._listeners: Dict[str, callable] = {}
+        self._observers: List[callable] = []
+        self.max_depth: int = 10
+
+    def _clone_message(self, message: AgentMessage) -> AgentMessage:
+        return message.model_copy(deep=True)
+
+    def _insert_chronologically(self, mission_id: UUID, message: AgentMessage) -> None:
+        conversation = self._conversations.setdefault(mission_id, [])
+        if not conversation or message.timestamp >= conversation[-1].timestamp:
+            conversation.append(message)
+            return
+
+        timestamps = [item.timestamp for item in conversation]
+        index = bisect_right(timestamps, message.timestamp)
+        conversation.insert(index, message)
+
+    def send_message(self, message: AgentMessage) -> None:
+        """Publish a single AgentMessage to its mission conversation.
+
+        The message is stored in timestamp order and isolated from subsequent
+        external mutation by keeping a deep copy internally.
 
         Args:
-            conversation: Conversation that owns all messages accepted by this
-                bus. Messages for any other mission are rejected.
-            max_depth: Maximum recursive listener-response depth allowed during
-                one dispatch chain. The value must be at least ``1``.
+            message: The AgentMessage to publish.
+
+        Raises:
+            TypeError: If the provided value is not an AgentMessage.
         """
-        if max_depth < 1:
-            raise ValueError("max_depth must be at least 1")
+        if not isinstance(message, AgentMessage):
+            raise TypeError("message must be an AgentMessage instance")
 
-        self._conversation: MissionConversation = conversation
-        self._listeners: dict[str, AgentCallback] = {}
-        self._history: list[AgentMessage] = []
-        self._processed_ids: set[UUID] = set()
-        self._lock: Lock = Lock()
-        self._max_depth: int = max_depth
-
-    @property
-    def mission_id(self) -> UUID:
-        """Return the mission identifier served by this bus."""
-        return self._conversation.mission_id
-
-    def register(self, agent_name: str, callback: AgentCallback) -> None:
-        """Register a receiver callback for an agent.
-
-        The callback receives a deep-copied ``AgentMessage`` and may return a
-        new ``AgentMessage`` to continue the dispatch chain. Registering a name
-        that already exists replaces the previous callback.
-        """
-        normalized_name = self._normalize_agent(agent_name)
-        if not callable(callback):
-            raise TypeError("callback must be callable")
-
+        copy = self._clone_message(message)
+        # enforce and propagate a depth counter in metadata to avoid infinite cycles
+        depth = int(copy.metadata.get("depth", 0) or 0) + 1
+        copy.metadata = {**copy.metadata, "depth": depth}
+        # Insert message under lock, but notify listeners/observers after releasing it
+        listener = None
+        observers: List[callable] = []
         with self._lock:
-            self._listeners[normalized_name] = callback
+            self._insert_chronologically(copy.mission_id, copy)
+            # capture recipient listener and observers to notify outside the lock
+            listener = self._listeners.get(copy.receiver)
+            observers = list(self._observers)
 
-    def unregister(self, agent_name: str) -> None:
-        """Remove an agent listener registration.
-
-        Unregistering an unknown agent is treated as an idempotent no-op.
-        """
-        normalized_name = self._normalize_agent(agent_name)
-        with self._lock:
-            self._listeners.pop(normalized_name, None)
-
-    def send(self, message: AgentMessage) -> AgentMessage | None:
-        """Store and deliver one message to its registered receiver.
-
-        ``None`` values are ignored for runtime robustness. Duplicate message
-        IDs, mission mismatches, unknown receivers, and recursive dispatch
-        chains beyond ``_max_depth`` are rejected.
-        """
-        return self._send(message, depth=0)
-
-    def broadcast(self, messages: list[AgentMessage]) -> list[AgentMessage]:
-        """Send multiple messages in the provided order.
-
-        ``None`` entries are ignored. The return value contains the non-``None``
-        listener responses produced directly by each top-level message, in the
-        same order as the accepted input messages.
-        """
-        responses: list[AgentMessage] = []
-        for message in messages:
-            if message is None:
+        # Notify observer callbacks and the specific recipient listener outside the lock
+        for obs in observers:
+            try:
+                obs(copy.model_copy(deep=True))
+            except Exception:
                 continue
-            response = self.send(message)
-            if response is not None:
-                responses.append(deepcopy(response))
-        return responses
 
-    def history(self) -> list[AgentMessage]:
-        """Return a deep-copied chronological history of accepted messages."""
-        with self._lock:
-            return deepcopy(self._history)
+        # If message depth exceeds maximum, do not deliver to agent listeners to prevent cycles.
+        if depth > self.max_depth:
+            return
 
-    def latest(self) -> AgentMessage | None:
-        """Return the latest accepted message, or ``None`` if the bus is empty."""
-        with self._lock:
-            if not self._history:
-                return None
-            return deepcopy(self._history[-1])
+        if listener:
+            try:
+                listener(copy.model_copy(deep=True))
+            except Exception:
+                pass
 
-    def messages_for(self, agent: str) -> list[AgentMessage]:
-        """Return all messages sent or received by ``agent``."""
-        normalized_agent = self._normalize_agent(agent)
-        with self._lock:
-            return deepcopy(
-                [
-                    message
-                    for message in self._history
-                    if message.sender == normalized_agent or message.receiver == normalized_agent
-                ]
-            )
+    def broadcast(self, message: AgentMessage, recipients: List[str]) -> None:
+        """Publish a message to a list of recipients within the same mission.
 
-    def pending(self, agent: str) -> list[AgentMessage]:
-        """Return response-requiring messages addressed to ``agent``.
+        Each recipient receives an isolated copy of the original message, which
+        preserves the message ordering and keeps stored messages immutable.
 
-        The bus dispatches synchronously, so "pending" means messages whose
-        receiver is ``agent`` and whose ``requires_response`` flag is set. The
-        returned messages are deep copies in chronological order.
+        Args:
+            message: The base AgentMessage to broadcast.
+            recipients: Names of agents that should receive the broadcast.
+
+        Raises:
+            TypeError: If the provided value is not an AgentMessage.
+            ValueError: If recipients is empty or contains only blank names.
         """
-        normalized_agent = self._normalize_agent(agent)
-        grouped: defaultdict[str, list[AgentMessage]] = defaultdict(list)
+        if not isinstance(message, AgentMessage):
+            raise TypeError("message must be an AgentMessage instance")
 
-        with self._lock:
-            for message in self._history:
-                if message.receiver == normalized_agent and message.requires_response:
-                    grouped[normalized_agent].append(message)
-            return deepcopy(grouped[normalized_agent])
+        cleaned_recipients = [recipient.strip() for recipient in recipients if recipient.strip()]
+        if not cleaned_recipients:
+            raise ValueError("recipients must contain at least one non-empty agent name")
 
-    def participants(self) -> list[str]:
-        """Return all conversation participants as a sorted list."""
-        return self._conversation.participants_list()
-
-    def clear(self) -> None:
-        """Clear stored messages and processed IDs while preserving listeners."""
-        with self._lock:
-            self._history.clear()
-            self._processed_ids.clear()
-        self._conversation.clear()
-
-    def _send(self, message: AgentMessage | None, depth: int) -> AgentMessage | None:
-        """Internal recursive dispatch implementation."""
-        if message is None:
-            return None
-        if depth > self._max_depth:
-            raise RuntimeError(f"self-recursive dispatch exceeded max_depth={self._max_depth}")
-        if message.mission_id != self._conversation.mission_id:
-            raise ValueError(
-                f"message mission_id {message.mission_id} does not match bus mission_id {self._conversation.mission_id}"
+        for recipient in cleaned_recipients:
+            broadcast_message = message.model_copy(
+                deep=True,
+                update={
+                    "receiver": recipient,
+                    "metadata": {**message.metadata, "broadcast": True, "recipient": recipient},
+                },
             )
+            self.send_message(broadcast_message)
 
-        stored_message = deepcopy(message)
+    def register_listener(self, agent_name: str, callback: callable) -> None:
+        """Register a callback to be invoked when a message addressed to agent_name arrives.
 
-        with self._lock:
-            if stored_message.id in self._processed_ids:
-                raise ValueError(f"duplicate message id rejected: {stored_message.id}")
-
-            listener = self._listeners.get(stored_message.receiver)
-            if listener is None:
-                raise ValueError(f"unknown receiver rejected: {stored_message.receiver}")
-
-            self._processed_ids.add(stored_message.id)
-
-        try:
-            self._conversation.add_message(stored_message)
-        except Exception:
-            with self._lock:
-                self._processed_ids.discard(stored_message.id)
-            raise
-
-        with self._lock:
-            self._history.append(deepcopy(stored_message))
-
-        listener_message = deepcopy(stored_message)
-        response = listener(listener_message)
-        if response is None:
-            return None
-
-        response_copy = deepcopy(response)
-        self._send(response_copy, depth=depth + 1)
-        return deepcopy(response_copy)
-
-    @staticmethod
-    def _normalize_agent(agent_name: str) -> str:
-        """Return a stripped non-empty agent name."""
-        normalized_name = agent_name.strip()
-        if not normalized_name:
+        The callback receives a single argument: an `AgentMessage` copy.
+        """
+        name = agent_name.strip()
+        if not name:
             raise ValueError("agent_name must be a non-empty string")
-        return normalized_name
+        with self._lock:
+            self._listeners[name] = callback
+
+    def unregister_listener(self, agent_name: str) -> None:
+        name = agent_name.strip()
+        if not name:
+            return
+        with self._lock:
+            self._listeners.pop(name, None)
+
+    def register_observer(self, callback: callable) -> None:
+        """Register an observer callback that receives every message published on the bus."""
+        with self._lock:
+            self._observers.append(callback)
+
+    def unregister_observer(self, callback: callable) -> None:
+        with self._lock:
+            try:
+                self._observers.remove(callback)
+            except ValueError:
+                pass
+
+    def get_messages(self, mission_id: UUID) -> List[AgentMessage]:
+        """Return a chronological list of messages for the requested mission."""
+        with self._lock:
+            return [message.model_copy(deep=True) for message in self._conversations.get(mission_id, [])]
+
+    def conversation_history(self, mission_id: UUID) -> List[AgentMessage]:
+        """Return the mission conversation history. Alias for get_messages."""
+        return self.get_messages(mission_id)
+
+    def latest_message(self, mission_id: UUID) -> AgentMessage | None:
+        """Return the latest message for the requested mission, or None if empty."""
+        with self._lock:
+            conversation = self._conversations.get(mission_id)
+            if not conversation:
+                return None
+            return conversation[-1].model_copy(deep=True)
+
+    def pending_messages(self, agent_name: str) -> List[AgentMessage]:
+        """Return messages that are addressed to the given agent."""
+        name = agent_name.strip()
+        if not name:
+            return []
+
+        with self._lock:
+            pending: List[AgentMessage] = []
+            for conversation in self._conversations.values():
+                for message in conversation:
+                    if message.receiver == name:
+                        pending.append(message.model_copy(deep=True))
+            pending.sort(key=lambda message: message.timestamp)
+            return pending
+
+    def get_agent_messages(self, agent_name: str) -> List[AgentMessage]:
+        """Return all messages sent or received by the specified agent."""
+        name = agent_name.strip()
+        if not name:
+            return []
+
+        with self._lock:
+            results: List[AgentMessage] = []
+            for conversation in self._conversations.values():
+                for message in conversation:
+                    if message.sender == name or message.receiver == name:
+                        results.append(message.model_copy(deep=True))
+            results.sort(key=lambda message: message.timestamp)
+            return results
+
+    def clear_mission(self, mission_id: UUID) -> None:
+        """Remove all stored messages for a specific mission."""
+        with self._lock:
+            self._conversations.pop(mission_id, None)
+
+    def clear_all(self) -> None:
+        """Remove all stored messages from the bus."""
+        with self._lock:
+            self._conversations.clear()
 
 
 if __name__ == "__main__":
-    mission = Mission(
-        title="Research AI startups in Europe for acquisition.",
-        objective="Coordinate research and finance review for European AI acquisition targets.",
-    )
-    conversation = MissionConversation.from_mission(mission)
-    bus = AgentBus(conversation=conversation)
+    mission_id = uuid4()
+    bus = AgentBus()
 
-    def ceo_listener(message: AgentMessage) -> AgentMessage | None:
-        print(f"CEO received: {message.content}")
-        return None
-
-    def research_listener(message: AgentMessage) -> AgentMessage | None:
-        print(f"Research received: {message.content}")
-        if message.sender == "CEO":
-            return AgentMessage(
-                mission_id=mission.id,
-                sender="Research",
-                receiver="Finance",
-                message_type=MessageType.QUESTION,
-                priority=Priority.MEDIUM,
-                content="Can you assess revenue quality and valuation ranges for the shortlist?",
-                parent_message_id=message.id,
-                requires_response=True,
-            )
-        if message.sender == "Finance":
-            return AgentMessage(
-                mission_id=mission.id,
-                sender="Research",
-                receiver="CEO",
-                message_type=MessageType.RESPONSE,
-                priority=Priority.HIGH,
-                content="Finance validated two targets for deeper diligence.",
-                parent_message_id=message.id,
-                confidence=0.88,
-            )
-        return None
-
-    def finance_listener(message: AgentMessage) -> AgentMessage | None:
-        print(f"Finance received: {message.content}")
-        return AgentMessage(
-            mission_id=mission.id,
-            sender="Finance",
-            receiver="Research",
-            message_type=MessageType.RESPONSE,
-            priority=Priority.MEDIUM,
-            content="Two companies show durable revenue and acceptable valuation ranges.",
-            parent_message_id=message.id,
-            confidence=0.84,
-        )
-
-    bus.register("CEO", ceo_listener)
-    bus.register("Research", research_listener)
-    bus.register("Finance", finance_listener)
-
-    bus.send(
-        AgentMessage(
-            mission_id=mission.id,
-            sender="CEO",
-            receiver="Research",
-            message_type=MessageType.TASK,
-            priority=Priority.HIGH,
-            content="Research AI startups in Europe for acquisition.",
-            requires_response=True,
-        )
+    task_message = AgentMessage(
+        mission_id=mission_id,
+        sender="CEO",
+        receiver="Research Agent",
+        message_type=MessageType.TASK,
+        priority=Priority.HIGH,
+        content="Evaluate market entry options for our new product line.",
+        confidence=0.98,
+        requires_response=True,
     )
 
-    print("Participants:", bus.participants())
+    evidence_message = AgentMessage(
+        mission_id=mission_id,
+        sender="Research Agent",
+        receiver="CEO",
+        message_type=MessageType.EVIDENCE,
+        priority=Priority.MEDIUM,
+        content="Preliminary research indicates demand strength in the target segment.",
+        confidence=0.91,
+        requires_response=False,
+    )
+
+    bus.send_message(task_message)
+    bus.send_message(evidence_message)
+
+    history = bus.conversation_history(mission_id)
     print("Conversation history:")
-    for item in bus.history():
-        print(item.summary())
+    for message in history:
+        print(message.summary())
+
+    finance_view = bus.get_agent_messages("Finance Agent")
+    print("Finance Agent view:", [message.to_dict() for message in finance_view])

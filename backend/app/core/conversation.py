@@ -1,336 +1,184 @@
 from __future__ import annotations
 
-from copy import deepcopy
-from datetime import datetime, timezone
-from threading import Lock
-from typing import Any
+from typing import Iterable, List, Optional, Sequence, Set, TypedDict
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
-
-try:
-    from .message import AgentMessage, MessageType, Priority
-    from .mission import Mission
-except ImportError:
-    from message import AgentMessage, MessageType, Priority
-    from mission import Mission
+from .agent_bus import AgentBus
+from .message import AgentMessage, MessageType, Priority
 
 
-class MissionConversation(BaseModel):
-    """Thread-safe chronological conversation for a single mission.
+class ConversationSummary(TypedDict):
+    total_messages: int
+    participating_agents: List[str]
+    first_timestamp: Optional[str]
+    last_timestamp: Optional[str]
 
-    ``MissionConversation`` owns the immutable history of messages exchanged
-    during a mission. Messages are copied on insert and copied again on
-    retrieval, which prevents callers from mutating the internal timeline after
-    messages have been accepted. All mutations are protected by a lock so the
-    conversation can be safely shared by multiple workers in the same process.
+
+class MissionConversation:
+    """Manage a mission-level conversation across collaborating agents.
+
+    The MissionConversation layer is responsible for creating, routing, and
+    summarizing every message exchanged between agents for a single mission.
+    It relies on the shared AgentBus to persist messages in timestamp order and
+    to isolate message storage from external mutation.
     """
 
-    model_config = ConfigDict(
-        arbitrary_types_allowed=True,
-        extra="forbid",
-        validate_assignment=True,
-    )
+    def __init__(self, mission_id: UUID, agent_bus: AgentBus) -> None:
+        self.mission_id = mission_id
+        self.agent_bus = agent_bus
 
-    mission_id: UUID = Field(
-        ...,
-        description="Identifier of the mission this conversation belongs to.",
-    )
-    started_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
-        description="Timezone-aware UTC timestamp when the conversation started.",
-    )
-    updated_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
-        description="Timezone-aware UTC timestamp for the latest conversation change.",
-    )
-    participants: set[str] = Field(
-        default_factory=set,
-        description="Agents that have sent or received at least one message.",
-    )
-    metadata: dict[str, Any] = Field(
-        default_factory=dict,
-        description="JSON-serializable extension data for integrations and auditing.",
-    )
+    def start(self) -> AgentMessage:
+        """Start the mission conversation with a system kickoff message."""
+        message = AgentMessage(
+            mission_id=self.mission_id,
+            sender="System",
+            receiver="Mission",
+            message_type=MessageType.SYSTEM,
+            priority=Priority.MEDIUM,
+            content=f"Mission {self.mission_id} conversation started.",
+            confidence=1.0,
+        )
+        self.agent_bus.send_message(message)
+        return message
 
-    _messages: list[AgentMessage] = PrivateAttr(default_factory=list)
-    _message_ids: set[UUID] = PrivateAttr(default_factory=set)
-    _lock: Lock = PrivateAttr(default_factory=Lock)
+    def send(
+        self,
+        sender: str,
+        receiver: str,
+        message_type: MessageType,
+        content: str,
+        priority: Priority = Priority.MEDIUM,
+        confidence: float = 1.0,
+    ) -> AgentMessage:
+        """Send a single message from one agent to another."""
+        message = AgentMessage(
+            mission_id=self.mission_id,
+            sender=sender,
+            receiver=receiver,
+            message_type=message_type,
+            priority=priority,
+            content=content,
+            confidence=confidence,
+        )
+        self.agent_bus.send_message(message)
+        return message
 
-    @field_validator("started_at", "updated_at")
-    @classmethod
-    def _normalize_timestamp_to_utc(cls, value: datetime) -> datetime:
-        """Return a timezone-aware UTC timestamp.
+    def broadcast(
+        self,
+        sender: str,
+        recipients: Iterable[str],
+        message_type: MessageType,
+        content: str,
+        priority: Priority = Priority.MEDIUM,
+        confidence: float = 1.0,
+    ) -> List[AgentMessage]:
+        """Broadcast a message from one agent to multiple recipients."""
+        cleaned_recipients = [recipient.strip() for recipient in recipients if recipient and recipient.strip()]
+        if not cleaned_recipients:
+            raise ValueError("recipients must contain at least one non-empty agent name")
 
-        Naive datetimes are rejected because their absolute point in time is
-        ambiguous. Aware datetimes from any time zone are converted to UTC.
-        """
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("conversation timestamps must be timezone-aware")
-        return value.astimezone(timezone.utc)
+        base_message = AgentMessage(
+            mission_id=self.mission_id,
+            sender=sender,
+            receiver=cleaned_recipients[0],
+            message_type=message_type,
+            priority=priority,
+            content=content,
+            confidence=confidence,
+            metadata={"broadcast": True, "recipients": cleaned_recipients},
+        )
 
-    @field_validator("participants")
-    @classmethod
-    def _normalize_participants(cls, value: set[str]) -> set[str]:
-        """Normalize participant names and reject empty participant entries."""
-        normalized_participants: set[str] = set()
-        for participant in value:
-            normalized = participant.strip()
-            if not normalized:
-                raise ValueError("participants must be non-empty strings")
-            normalized_participants.add(normalized)
-        return normalized_participants
+        self.agent_bus.broadcast(base_message, cleaned_recipients)
 
-    @property
-    def messages(self) -> list[AgentMessage]:
-        """Return a deep-copied snapshot of the conversation messages.
-
-        The returned list and its ``AgentMessage`` instances are detached from
-        internal storage. Mutating them cannot affect the stored conversation.
-        """
-        return self.history()
-
-    @classmethod
-    def from_mission(cls, mission: Mission, metadata: dict[str, Any] | None = None) -> MissionConversation:
-        """Create a conversation for an existing mission.
-
-        The mission identifier is copied from ``mission.id`` and the optional
-        metadata is defensively copied so later caller mutations do not leak
-        into the conversation.
-        """
-        return cls(mission_id=mission.id, metadata=deepcopy(metadata or {}))
-
-    def _touch(self) -> None:
-        """Refresh ``updated_at`` after an intentional state change."""
-        self.updated_at = datetime.now(timezone.utc)
-
-    def _add_message_unlocked(self, message: AgentMessage | None) -> None:
-        """Validate and insert one message while the caller holds ``_lock``."""
-        if message is None:
-            return
-        if message.mission_id != self.mission_id:
-            raise ValueError(
-                f"message mission_id {message.mission_id} does not match conversation mission_id {self.mission_id}"
+        return [
+            base_message.model_copy(
+                deep=True,
+                update={
+                    "receiver": recipient,
+                    "metadata": {**base_message.metadata, "recipient": recipient},
+                },
             )
-        if message.id in self._message_ids:
-            raise ValueError(f"duplicate message id rejected: {message.id}")
+            for recipient in cleaned_recipients
+        ]
 
-        copied_message = deepcopy(message)
-        self._messages.append(copied_message)
-        self._message_ids.add(copied_message.id)
-        self.participants = {
-            *self.participants,
-            copied_message.sender,
-            copied_message.receiver,
+    def history(self) -> List[AgentMessage]:
+        """Return the full conversation history for this mission."""
+        return self.agent_bus.conversation_history(self.mission_id)
+
+    def timeline(self) -> List[AgentMessage]:
+        """Return mission messages ordered by timestamp."""
+        return sorted(self.history(), key=lambda message: message.timestamp)
+
+    def participants(self) -> Set[str]:
+        """Return all unique agent names that participated in the mission."""
+        participants: Set[str] = set()
+        for message in self.history():
+            participants.add(message.sender)
+            participants.add(message.receiver)
+        return participants
+
+    def latest(self) -> Optional[AgentMessage]:
+        """Return the latest message published in the mission, or None if empty."""
+        return self.agent_bus.latest_message(self.mission_id)
+
+    def summary(self) -> ConversationSummary:
+        """Return a compact summary of the mission conversation."""
+        messages = self.timeline()
+        participants = sorted(self.participants())
+        first_timestamp = messages[0].timestamp.isoformat() if messages else None
+        last_timestamp = messages[-1].timestamp.isoformat() if messages else None
+
+        return ConversationSummary(
+            total_messages=len(messages),
+            participating_agents=participants,
+            first_timestamp=first_timestamp,
+            last_timestamp=last_timestamp,
+        )
+
+    def export(self) -> dict[str, object]:
+        """Return a serializable export payload for the mission conversation."""
+        return {
+            "mission_id": str(self.mission_id),
+            "summary": self.summary(),
+            "participants": sorted(self.participants()),
+            "messages": [message.to_dict() for message in self.timeline()],
         }
-        self._touch()
-
-    def start(self) -> None:
-        """Mark the conversation as started and refresh its timestamp.
-
-        ``start`` is useful when a conversation object is constructed before
-        execution begins. It resets ``started_at`` and ``updated_at`` to the
-        current UTC time without altering existing messages.
-        """
-        with self._lock:
-            now = datetime.now(timezone.utc)
-            self.started_at = now
-            self.updated_at = now
-
-    def add_message(self, message: AgentMessage) -> None:
-        """Append one message to the conversation in insertion order.
-
-        ``None`` messages are ignored, duplicate message IDs are rejected, and
-        messages for a different mission are rejected. Accepted messages are
-        deep-copied before storage, participants are updated automatically, and
-        ``updated_at`` is refreshed.
-        """
-        with self._lock:
-            self._add_message_unlocked(message)
-
-    def broadcast(self, messages: list[AgentMessage]) -> None:
-        """Append multiple messages atomically in the provided order.
-
-        The method preserves the caller's message order, ignores ``None``
-        entries, and rejects the entire broadcast if any non-``None`` message is
-        invalid or has a duplicate ID. On success, all messages are inserted
-        under a single lock and ``updated_at`` reflects the final insert.
-        """
-        with self._lock:
-            pending_messages = [message for message in messages if message is not None]
-            pending_ids: set[UUID] = set()
-
-            for message in pending_messages:
-                if message.mission_id != self.mission_id:
-                    raise ValueError(
-                        f"message mission_id {message.mission_id} does not match conversation mission_id {self.mission_id}"
-                    )
-                if message.id in self._message_ids or message.id in pending_ids:
-                    raise ValueError(f"duplicate message id rejected: {message.id}")
-                pending_ids.add(message.id)
-
-            for message in pending_messages:
-                self._add_message_unlocked(message)
-
-    def history(self) -> list[AgentMessage]:
-        """Return the full conversation history as a deep-copied list."""
-        with self._lock:
-            return deepcopy(self._messages)
-
-    def latest(self) -> AgentMessage | None:
-        """Return the latest inserted message, or ``None`` when history is empty."""
-        with self._lock:
-            if not self._messages:
-                return None
-            return deepcopy(self._messages[-1])
-
-    def timeline(self) -> list[AgentMessage]:
-        """Return messages in preserved chronological insertion order."""
-        return self.history()
-
-    def between(self, sender: str, receiver: str) -> list[AgentMessage]:
-        """Return messages sent from ``sender`` to ``receiver``.
-
-        Sender and receiver inputs are whitespace-normalized before matching.
-        The result is a deep-copied snapshot in insertion order.
-        """
-        normalized_sender = sender.strip()
-        normalized_receiver = receiver.strip()
-        if not normalized_sender or not normalized_receiver:
-            raise ValueError("sender and receiver must be non-empty strings")
-
-        with self._lock:
-            return deepcopy(
-                [
-                    message
-                    for message in self._messages
-                    if message.sender == normalized_sender and message.receiver == normalized_receiver
-                ]
-            )
-
-    def participant_messages(self, agent: str) -> list[AgentMessage]:
-        """Return all messages sent or received by ``agent`` in insertion order."""
-        normalized_agent = agent.strip()
-        if not normalized_agent:
-            raise ValueError("agent must be a non-empty string")
-
-        with self._lock:
-            return deepcopy(
-                [
-                    message
-                    for message in self._messages
-                    if message.sender == normalized_agent or message.receiver == normalized_agent
-                ]
-            )
-
-    def participants_list(self) -> list[str]:
-        """Return conversation participants as a sorted list."""
-        with self._lock:
-            return sorted(self.participants)
-
-    def total_messages(self) -> int:
-        """Return the number of stored messages."""
-        with self._lock:
-            return len(self._messages)
-
-    def summary(self) -> dict[str, Any]:
-        """Return a compact JSON-serializable summary of the conversation."""
-        with self._lock:
-            first_timestamp = self._messages[0].timestamp.isoformat() if self._messages else None
-            latest_timestamp = self._messages[-1].timestamp.isoformat() if self._messages else None
-
-            return {
-                "mission_id": str(self.mission_id),
-                "started_at": self.started_at.isoformat(),
-                "updated_at": self.updated_at.isoformat(),
-                "participants": sorted(self.participants),
-                "total_messages": len(self._messages),
-                "first_message_at": first_timestamp,
-                "latest_message_at": latest_timestamp,
-            }
-
-    def export_json(self) -> dict[str, Any]:
-        """Return a JSON-serializable export of metadata and message history."""
-        with self._lock:
-            return {
-                "mission_id": str(self.mission_id),
-                "started_at": self.started_at.isoformat(),
-                "updated_at": self.updated_at.isoformat(),
-                "participants": sorted(self.participants),
-                "messages": [message.to_dict() for message in self._messages],
-                "metadata": deepcopy(self.metadata),
-            }
-
-    def clear(self) -> None:
-        """Remove all messages and participants from the conversation.
-
-        Metadata and mission identity are preserved. ``updated_at`` is refreshed
-        so downstream consumers can observe the state reset.
-        """
-        with self._lock:
-            self._messages.clear()
-            self._message_ids.clear()
-            self.participants = set()
-            self._touch()
 
 
 if __name__ == "__main__":
-    mission = Mission(
-        title="Research AI startups in Europe for acquisition.",
-        objective="Identify acquisition-ready European AI startups with strong enterprise traction.",
-    )
+    from uuid import uuid4
 
-    conversation = MissionConversation.from_mission(mission)
+    mission_id = uuid4()
+    agent_bus = AgentBus()
+    conversation = MissionConversation(mission_id=mission_id, agent_bus=agent_bus)
+
     conversation.start()
-
-    ceo_to_research = AgentMessage(
-        mission_id=mission.id,
+    conversation.send(
         sender="CEO",
         receiver="Research",
         message_type=MessageType.TASK,
+        content="Please investigate customer adoption trends for our AI product.",
         priority=Priority.HIGH,
-        content="Identify promising AI startups in Europe for acquisition.",
-        requires_response=True,
     )
-    research_to_finance = AgentMessage(
-        mission_id=mission.id,
+
+    conversation.send(
         sender="Research",
         receiver="Finance",
         message_type=MessageType.QUESTION,
+        content="What financial metrics should we use to benchmark adoption growth?",
         priority=Priority.MEDIUM,
-        content="Can you assess revenue quality and likely valuation ranges?",
-        parent_message_id=ceo_to_research.id,
-        requires_response=True,
+        confidence=0.92,
     )
-    finance_to_research = AgentMessage(
-        mission_id=mission.id,
+
+    conversation.send(
         sender="Finance",
         receiver="Research",
-        message_type=MessageType.RESPONSE,
+        message_type=MessageType.ANSWER,
+        content="Use ARR, gross margin, and customer acquisition cost for the first three quarters.",
         priority=Priority.MEDIUM,
-        content="Two targets show durable revenue and valuation ranges worth deeper diligence.",
-        parent_message_id=research_to_finance.id,
-        confidence=0.84,
-    )
-    research_to_ceo = AgentMessage(
-        mission_id=mission.id,
-        sender="Research",
-        receiver="CEO",
-        message_type=MessageType.RESPONSE,
-        priority=Priority.HIGH,
-        content="We recommend deeper diligence on two European AI infrastructure startups.",
-        parent_message_id=ceo_to_research.id,
-        confidence=0.88,
+        confidence=0.87,
     )
 
-    conversation.broadcast(
-        [
-            ceo_to_research,
-            research_to_finance,
-            finance_to_research,
-            research_to_ceo,
-        ]
-    )
-
-    print("Conversation summary:", conversation.summary())
-    print("Conversation export:", conversation.export_json())
+    summary = conversation.summary()
+    print("Conversation summary:", summary)
+    print("Export payload:", conversation.export())

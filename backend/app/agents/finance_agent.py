@@ -1,446 +1,125 @@
-from __future__ import annotations
+from groq import Groq
+from app.core.config import settings
 
-import json
-import re
-import sys
-from copy import deepcopy
-from pathlib import Path
-from typing import Any
-from uuid import UUID
+client = Groq(api_key=settings.GROQ_API_KEY)
 
-try:
-    from app.agents.base import BaseAgent
-    from app.core.agent_bus import AgentBus
-    from app.core.conversation import MissionConversation
-    from app.core.message import AgentMessage, MessageType, Priority
-    from app.core.mission import Mission
-except ImportError:
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from agents.base import BaseAgent
-    from core.agent_bus import AgentBus
-    from core.conversation import MissionConversation
-    from core.message import AgentMessage, MessageType, Priority
-    from core.mission import Mission
+def run_finance_agent(task: str) -> str:
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": f"""You are a Senior Financial Analyst with strict accuracy standards.
 
+Task: {task}
 
-MarketingPayload = dict[str, object]
+STRICT RULES:
+- NEVER invent specific numbers without assumptions
+- Always show calculation formulas
+- Always provide ranges not exact figures
+- Always state your assumptions explicitly
+- Flag all estimates clearly with ⚠️ ESTIMATE
 
+Structure your response as:
 
-class MarketingAgent(BaseAgent):
-    """
-    Enterprise AI OS Marketing Agent.
+## REQUIRED ASSUMPTIONS
+(List assumptions needed for financial analysis)
 
-    Responsibilities
-    - Market analysis
-    - ICP generation
-    - TAM/SAM/SOM estimation
-    - Competitor landscape
-    - Positioning
-    - Go-To-Market strategy
-    - Marketing risk analysis
+## BUDGET RANGES (not exact numbers)
+- Low estimate: $X - $Y (formula: ...)
+- Mid estimate: $X - $Y (formula: ...)
+- High estimate: $X - $Y (formula: ...)
 
-    Deterministic implementation.
-    No external APIs.
-    """
+## ROI PROJECTION
+- Best case: X% (assumptions: ...)
+- Base case: X% (assumptions: ...)
+- Worst case: X% (assumptions: ...)
 
-    _MARKETING_TERMS = frozenset(
-        {
-            "market",
-            "customer",
-            "startup",
-            "competition",
-            "pricing",
-            "growth",
-            "launch",
-            "marketing",
-            "brand",
-            "product",
-            "positioning",
-            "sales",
-            "gtm",
-            "go-to-market",
-            "acquisition",
-        }
+## FINANCIAL RISKS
+(Ranked by severity)
+
+## UNCERTAINTY FLAGS
+⚠️ Items that need more data before financial commitment
+
+## FINANCIAL CONFIDENCE: [X]%
+Reasoning: explain confidence level
+
+No invented numbers. Ranges only. Show your work."""}],
+        max_tokens=1000
     )
+    return response.choices[0].message.content
 
-    def __init__(self, bus: AgentBus | None = None) -> None:
-        resolved_bus = bus if bus else self._default_bus()
 
+from app.agents.base import BaseAgent
+from app.core.message import AgentMessage, MessageType, Priority
+from uuid import uuid4
+
+
+class FinanceAgent(BaseAgent):
+    def __init__(self) -> None:
         super().__init__(
-            name="Marketing",
-            role="Marketing Strategist",
-            description="Analyzes markets and builds GTM strategies.",
-            bus=resolved_bus,
+            name="Finance",
+            role="Financial Analyst",
+            description="Provides financial analysis and funding evaluation.",
         )
-
         self._started = False
-        self._analysis: dict[UUID, MarketingPayload] = {}
 
     def initialize(self) -> None:
         self._started = True
+        self.log("FinanceAgent initialized.")
+
+    def can_handle(self, mission) -> bool:
+        return self.name in getattr(mission, "assigned_agents", []) or "finance" in getattr(mission, "objective", "").lower()
+
+    def handle_task(self, message: AgentMessage) -> AgentMessage:
+        # Handle questions or tasks by producing a financial analysis
+        self.receive(message)
+        task_text = message.content
+        try:
+            output = run_finance_agent(task_text)
+        except Exception:
+            output = "Finance analysis could not be completed."
+
+        response = message.model_copy(
+            deep=True,
+            update={
+                "id": uuid4(),
+                "sender": self.name,
+                "receiver": message.sender,
+                "message_type": MessageType.RESPONSE,
+                "content": output,
+                "confidence": 0.85,
+                "parent_message_id": message.id,
+            },
+        )
+        return response
+
+    def review(self, message: AgentMessage) -> AgentMessage:
+        self.receive(message)
+        response = message.model_copy(deep=True, update={
+            "sender": self.name,
+            "receiver": message.sender,
+            "message_type": MessageType.RESPONSE,
+            "content": "Finance review completed.",
+            "confidence": 0.9,
+        })
+        return response
+
+    def health(self) -> dict[str, object]:
+        return {"name": self.name, "role": self.role, "status": "healthy" if self._started else "initializing"}
 
     def shutdown(self) -> None:
         self._started = False
-        self._analysis.clear()
+        self.log("FinanceAgent has shut down.")
 
-    def health(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "role": self.role,
-            "status": "healthy" if self._started else "initializing",
-            "processed_messages": len(self.processed_messages),
-            "tracked_threads": len(self._analysis),
-        }
-
-    def can_handle(self, mission: Mission) -> bool:
-        text = f"{mission.title} {mission.objective}".lower()
-
-        return (
-            self.name in mission.assigned_agents
-            or any(term in text for term in self._MARKETING_TERMS)
-        )
-
-    def receive(self, message: AgentMessage):
-        if not self.validate_message(message):
-            raise ValueError("Message not intended for Marketing.")
-
-        if self.has_processed(message.id):
-            return None
-
-        self.mark_processed(message.id)
-
-        if message.message_type in (
-            MessageType.TASK,
-            MessageType.QUESTION,
-        ):
-            return self.handle_task(message)
-
-        return self.review(message)
-
-    def handle_task(self, message: AgentMessage):
-        payload = self._generate_analysis(message.content)
-
-        thread = message.parent_message_id or message.id
-
-        self._analysis[thread] = deepcopy(payload)
-
-        return AgentMessage(
-            mission_id=message.mission_id,
-            sender=self.name,
-            receiver=message.sender,
-            message_type=MessageType.RESPONSE,
-            priority=Priority.MEDIUM,
-            content=json.dumps(payload, indent=2),
-            confidence=float(payload["confidence"]),
-            metadata={
-                "agent": "Marketing",
-                "structured": True,
-            },
-            requires_response=False,
-            parent_message_id=message.id,
-        )
-
-    def review(self, message: AgentMessage):
-        thread = message.parent_message_id or message.id
-
-        payload = deepcopy(
-            self._analysis.get(thread, self._generate_analysis(message.content))
-        )
-
-        payload["reviewed"] = True
-        payload["recommended_next_step"] = (
-            "CEO should validate GTM assumptions before execution."
-        )
-
-        return AgentMessage(
-            mission_id=message.mission_id,
-            sender=self.name,
-            receiver=message.sender,
-            message_type=MessageType.RESPONSE,
-            priority=Priority.MEDIUM,
-            content=json.dumps(payload, indent=2),
-            confidence=float(payload["confidence"]),
-            metadata={
-                "review": True,
-            },
-            requires_response=False,
-            parent_message_id=message.id,
-        )
-
-    def _generate_analysis(self, text: str) -> MarketingPayload:
-        keywords = self._keywords(text)
-
-        return {
-            "executive_summary":
-                "Market opportunity appears attractive based on the supplied mission context.",
-
-            "target_market": {
-                "primary": "Technology organizations",
-                "secondary": "Enterprise digital transformation teams",
-            },
-
-            "ideal_customer_profile": {
-                "industry": "Technology",
-                "company_size": "50-5000 employees",
-                "decision_makers": [
-                    "CEO",
-                    "CTO",
-                    "Head of AI",
-                    "Product Director",
-                ],
-                "pain_points": [
-                    "Slow decision making",
-                    "Fragmented AI tools",
-                    "Poor operational visibility",
-                ],
-            },
-
-            "tam": {
-                "description":
-                    "Global organizations investing in AI transformation.",
-                "confidence": "Medium",
-            },
-
-            "sam": {
-                "description":
-                    "Mid-market and enterprise companies adopting GenAI.",
-                "confidence": "Medium",
-            },
-
-            "som": {
-                "description":
-                    "Early adopters reachable within first GTM phase.",
-                "confidence": "Medium",
-            },
-
-            "competitors": [
-                {
-                    "name": "Microsoft Copilot",
-                    "strength": "Enterprise ecosystem",
-                    "weakness": "Limited customization",
-                },
-                {
-                    "name": "OpenAI Enterprise",
-                    "strength": "General intelligence",
-                    "weakness": "Not vertically specialized",
-                },
-                {
-                    "name": "Anthropic Claude",
-                    "strength": "Safety",
-                    "weakness": "Smaller ecosystem",
-                },
-            ],
-
-            "positioning": (
-                "Enterprise AI Operating System enabling multiple AI agents "
-                "to collaborate on strategic business decisions."
-            ),
-
-            "marketing_channels": [
-                "LinkedIn",
-                "GitHub",
-                "Technical blogs",
-                "AI conferences",
-                "Product Hunt",
-                "Founder communities",
-            ],
-
-            "acquisition_strategy": [
-                "Content marketing",
-                "Thought leadership",
-                "Case studies",
-                "Open-source demo",
-                "Founder outreach",
-            ],
-
-            "pricing_strategy": {
-                "starter": "Free",
-                "professional": "Subscription",
-                "enterprise": "Custom pricing",
-            },
-
-            "launch_plan": [
-                "Private alpha",
-                "Pilot customers",
-                "Public beta",
-                "Enterprise launch",
-            ],
-
-            "marketing_risks": [
-                {
-                    "severity": "High",
-                    "risk": "Crowded AI market",
-                    "mitigation": "Differentiate using multi-agent collaboration",
-                },
-                {
-                    "severity": "Medium",
-                    "risk": "Low awareness",
-                    "mitigation": "Educational content",
-                },
-                {
-                    "severity": "Medium",
-                    "risk": "Long enterprise sales cycle",
-                    "mitigation": "Pilot programs",
-                },
-            ],
-
-            "keywords": keywords,
-
-            "confidence": 0.86,
-
-            "recommended_next_step":
-                "Validate ICP with pilot customers and refine GTM messaging.",
-        }
-
-    @staticmethod
-    def _keywords(text: str) -> list[str]:
-        words = re.findall(r"[A-Za-z]{4,}", text.lower())
-
-        stop = {
-            "this",
-            "that",
-            "with",
-            "from",
-            "have",
-            "will",
-            "into",
-            "about",
-            "their",
-            "there",
-            "which",
-            "should",
-            "would",
-            "could",
-            "using",
-        }
-
-        seen = set()
-        result = []
-
-        for word in words:
-            if word in stop:
-                continue
-
-            if word not in seen:
-                seen.add(word)
-                result.append(word)
-
-        return result[:15]
-
-    @staticmethod
-    def _default_bus() -> AgentBus:
-        """
-        Create an isolated AgentBus so the agent can be instantiated
-        before being attached to an Orchestrator.
-        """
-        mission = Mission(
-            title="Marketing Control Mission",
-            objective="Initialize MarketingAgent.",
-            assigned_agents=["Marketing"],
-        )
-
-        conversation = MissionConversation.from_mission(mission)
-        return AgentBus(conversation)
-
-
-def run_marketing_agent(task: str) -> str:
-    """
-    Compatibility helper for standalone execution.
-    """
-
-    agent = MarketingAgent()
-
-    try:
-        mission = Mission(
-            title="Standalone Marketing Task",
-            objective=task,
-            assigned_agents=["Marketing"],
-        )
-
-        conversation = MissionConversation.from_mission(mission)
-        bus = AgentBus(conversation)
-
-        responses: list[AgentMessage] = []
-
-        def requester(message: AgentMessage):
-            responses.append(message)
-            return None
-
-        bus.register("Requester", requester)
-
-        setattr(agent, "_bus", bus)
-
-        bus.register(agent.name, agent.receive)
-
-        agent.initialize()
-
-        bus.send(
+    def execute(self, task: str) -> str:
+        # Provide backward-compatible execute API used by orchestrator
+        response_message = self.handle_task(
             AgentMessage(
-                mission_id=mission.id,
-                sender="Requester",
-                receiver="Marketing",
+                mission_id=uuid4(),
+                sender="CEO",
+                receiver=self.name,
                 message_type=MessageType.TASK,
                 priority=Priority.HIGH,
                 content=task,
                 confidence=1.0,
-                requires_response=True,
             )
         )
-
-        if not responses:
-            raise RuntimeError("MarketingAgent produced no response.")
-
-        return responses[-1].content
-
-    finally:
-        agent.shutdown()
-
-
-if __name__ == "__main__":
-
-    mission = Mission(
-        title="AI OS Launch",
-        objective=(
-            "Build a go-to-market strategy for an Enterprise AI Operating "
-            "System targeting enterprise customers."
-        ),
-        assigned_agents=["Marketing"],
-    )
-
-    conversation = MissionConversation.from_mission(mission)
-
-    bus = AgentBus(conversation)
-
-    def ceo_listener(message: AgentMessage):
-        print("\n===== MARKETING REPORT =====\n")
-        print(message.content)
-        return None
-
-    bus.register("CEO", ceo_listener)
-
-    marketing = MarketingAgent(bus)
-
-    marketing.initialize()
-
-    bus.send(
-        AgentMessage(
-            mission_id=mission.id,
-            sender="CEO",
-            receiver="Marketing",
-            message_type=MessageType.TASK,
-            priority=Priority.HIGH,
-            content=(
-                "Prepare a GTM strategy for Enterprise AI OS. "
-                "Identify ICP, TAM, SAM, SOM, competitors, "
-                "marketing channels, pricing, positioning, "
-                "launch strategy and risks."
-            ),
-            confidence=1.0,
-            requires_response=True,
-        )
-    )
-
-    print("\n===== HEALTH =====")
-    print(json.dumps(marketing.health(), indent=2))
-
-    marketing.shutdown()
+        return response_message.content
