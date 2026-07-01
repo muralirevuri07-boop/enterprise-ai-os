@@ -1,227 +1,352 @@
 from __future__ import annotations
 
-import logging
-from abc import ABC, abstractmethod
-from typing import Any, Dict
+import abc
+import sys
+from copy import deepcopy
+from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock
+from typing import Any
+from uuid import UUID, uuid4
 
-from app.core.message import AgentMessage
-from app.core.mission import Mission
-from app.core.agent_bus import AgentBus
-from app.core.message import MessageType
+try:
+    from app.core.agent_bus import AgentBus
+    from app.core.conversation import MissionConversation
+    from app.core.message import AgentMessage, MessageType, Priority
+    from app.core.mission import Mission
+except ImportError:
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+    from core.agent_bus import AgentBus
+    from core.conversation import MissionConversation
+    from core.message import AgentMessage, MessageType, Priority
+    from core.mission import Mission
 
 
-class BaseAgent(ABC):
-    """Abstract base class that defines the contract for Enterprise AI OS agents."""
+class BaseAgent(abc.ABC):
+    """Abstract foundation for Enterprise AI OS agents.
 
-    def __init__(self, name: str, role: str, description: str) -> None:
-        self._name = name.strip()
-        self._role = role.strip()
-        self._description = description.strip()
-        if not self._name:
-            raise ValueError("Agent name must be a non-empty string")
-        if not self._role:
-            raise ValueError("Agent role must be a non-empty string")
-        if not self._description:
-            raise ValueError("Agent description must be a non-empty string")
+    ``BaseAgent`` provides the shared runtime behavior every concrete agent
+    needs: immutable identity, bus registration, inbound message validation,
+    duplicate-message protection, routing by message type, outbound dispatch,
+    metadata storage, and JSON-safe operational introspection.
 
-        self._logger = logging.getLogger(f"enterprise_ai_os.agent.{self._name}")
-        self._logger.addHandler(logging.NullHandler())
-        self._processed_message_ids: set = set()
-        self._requested_finance_missions: set = set()
+    Subclasses implement domain behavior through the abstract lifecycle and
+    processing methods. The bus calls ``receive`` directly when a message is
+    addressed to the agent; ``receive`` then routes tasks to ``handle_task`` and
+    reviewable artifacts to ``review``.
+    """
+
+    _REVIEW_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
+        {
+            MessageType.RESPONSE,
+            MessageType.ANSWER,
+            MessageType.EVIDENCE,
+            MessageType.APPROVAL,
+        }
+    )
+
+    def __init__(self, name: str, role: str, description: str, bus: AgentBus) -> None:
+        """Create and register an agent on an ``AgentBus``.
+
+        Args:
+            name: Unique bus-facing agent name. Incoming messages must use this
+                value as their receiver.
+            role: Human-readable operating role for monitoring and governance.
+            description: Concise explanation of the agent's responsibility.
+            bus: Message bus used for receiving and sending ``AgentMessage``
+                instances.
+
+        Raises:
+            ValueError: If ``name``, ``role``, or ``description`` is empty.
+            TypeError: If ``bus`` does not provide the required bus interface.
+        """
+        self._name = self._normalize_text(name, "name")
+        self._role = self._normalize_text(role, "role")
+        self._description = self._normalize_text(description, "description")
+        if not all(hasattr(bus, attribute) for attribute in ("register", "send", "mission_id")):
+            raise TypeError("bus must provide register(), send(), and mission_id")
+
+        self._id: UUID = uuid4()
+        self._created_at: datetime = datetime.now(timezone.utc)
+        self._processed_messages: set[UUID] = set()
+        self._metadata: dict[str, Any] = {}
+        self._bus: AgentBus = bus
+        self._lock: Lock = Lock()
+
+        self._bus.register(self._name, self.receive)
+
+    @property
+    def id(self) -> UUID:
+        """Stable immutable identifier for this agent instance."""
+        return self._id
 
     @property
     def name(self) -> str:
-        """Return the canonical name of this agent."""
+        """Bus-facing canonical agent name."""
         return self._name
 
     @property
     def role(self) -> str:
-        """Return the operational role of this agent."""
+        """Human-readable role assigned to the agent."""
         return self._role
 
     @property
     def description(self) -> str:
-        """Return a short description of what this agent does."""
+        """Short operational description of the agent."""
         return self._description
 
-    @abstractmethod
+    @property
+    def created_at(self) -> datetime:
+        """Timezone-aware UTC creation timestamp."""
+        return self._created_at
+
+    @property
+    def processed_messages(self) -> set[UUID]:
+        """Return a snapshot of processed message identifiers."""
+        with self._lock:
+            return set(self._processed_messages)
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """Return a deep-copied snapshot of mutable agent metadata."""
+        with self._lock:
+            return deepcopy(self._metadata)
+
+    @abc.abstractmethod
     def initialize(self) -> None:
-        """Perform any startup logic required before the agent can receive tasks."""
+        """Prepare the agent for work after construction."""
 
-    @abstractmethod
+    @abc.abstractmethod
     def can_handle(self, mission: Mission) -> bool:
-        """Return True when this agent is responsible for the provided mission."""
+        """Return whether this agent is suitable for ``mission``."""
 
-    @abstractmethod
-    def handle_task(self, message: AgentMessage) -> AgentMessage:
-        """Process a task message and return the resulting response message."""
+    @abc.abstractmethod
+    def handle_task(self, message: AgentMessage) -> AgentMessage | None:
+        """Handle a task message and optionally return a response message."""
 
-    @abstractmethod
-    def review(self, message: AgentMessage) -> AgentMessage:
-        """Review a message or mission artifact and return an annotated response."""
+    @abc.abstractmethod
+    def review(self, message: AgentMessage) -> AgentMessage | None:
+        """Review a response, answer, evidence item, or approval message."""
 
-    @abstractmethod
-    def health(self) -> Dict[str, Any]:
-        """Return a health payload used for monitoring and readiness checks."""
+    @abc.abstractmethod
+    def health(self) -> dict[str, Any]:
+        """Return operational health details for monitoring."""
 
-    @abstractmethod
+    @abc.abstractmethod
     def shutdown(self) -> None:
-        """Gracefully release resources before agent termination."""
+        """Release resources and stop accepting work gracefully."""
 
-    def log(self, message: str, level: int = logging.INFO) -> None:
-        """Log a lifecycle or diagnostic message for the agent."""
-        self._logger.log(level, message)
+    def send(self, message: AgentMessage) -> AgentMessage | None:
+        """Send an outbound message through the attached bus.
 
-    def validate_message(self, message: AgentMessage) -> bool:
-        """Validate that the supplied object is a well-formed agent message."""
-        return isinstance(message, AgentMessage)
-
-    def send(self, message: AgentMessage) -> AgentMessage:
-        """Prepare an outgoing message for delivery through the agent bus."""
-        if not self.validate_message(message):
-            raise ValueError("message must be an AgentMessage instance")
-        return message
-
-    def attach_to_bus(self, agent_bus: AgentBus) -> None:
-        """Attach this agent to an AgentBus so it can receive and send messages.
-
-        Registers an internal listener on the bus under the agent's name.
+        Outbound messages must be valid ``AgentMessage`` instances for the same
+        mission as the bus, and their sender must match this agent's name. The
+        bus performs receiver validation and duplicate protection.
         """
-        self._agent_bus = agent_bus
-        agent_bus.register_listener(self.name, self._on_bus_message)
+        if not self._looks_like_message(message):
+            raise TypeError("message must provide the AgentMessage interface")
+        if message.sender != self.name:
+            raise ValueError(f"outbound message sender must be {self.name}")
+        if message.mission_id != self._bus.mission_id:
+            raise ValueError("outbound message mission_id does not match the agent bus")
+        return self._bus.send(message)
 
-    def detach_from_bus(self) -> None:
-        if hasattr(self, "_agent_bus") and self._agent_bus:
+    def receive(self, message: AgentMessage) -> AgentMessage | None:
+        """Validate, deduplicate, and route an inbound message."""
+        if not self.validate_message(message):
+            raise ValueError(f"message is not addressed to agent {self.name}")
+
+        if self.has_processed(message.id):
+            return None
+        self.mark_processed(message.id)
+
+        if self._message_type_matches(message.message_type, MessageType.TASK):
+            result = self.handle_task(message)
+            self._report_to_agentwatch(
+                event_type=str(message.message_type.value),
+                input_data=str(message.content)[:500],
+                output_data=str(result.content)[:500] if result else None,
+                confidence=getattr(result, "confidence", None),
+            )
+            return result
+        if any(self._message_type_matches(message.message_type, mt) for mt in self._REVIEW_MESSAGE_TYPES):
+            return self.review(message)
+        return None
+
+    def _report_to_agentwatch(self, event_type: str, input_data: str = None, output_data: str = None, confidence: float = None) -> None:
+        import os, threading, requests
+        api_key = os.getenv("AGENTWATCH_API_KEY")
+        api_url = os.getenv("AGENTWATCH_URL", "https://agentwatch-8eap.onrender.com")
+        if not api_key:
+            return
+        payload = {
+            "api_key": api_key,
+            "agent_name": self._name,
+            "event_type": event_type,
+            "input_data": input_data,
+            "output_data": output_data,
+            "confidence": confidence,
+            "is_irreversible": any(k in event_type.lower() for k in ["hire", "fire", "invest", "pricing", "contract", "deploy"]),
+        }
+        def send():
             try:
-                self._agent_bus.unregister_listener(self.name)
-            finally:
-                self._agent_bus = None
-
-    def deliver(self, message: AgentMessage) -> None:
-        """Deliver a prepared AgentMessage into the attached AgentBus."""
-        if not hasattr(self, "_agent_bus") or self._agent_bus is None:
-            raise RuntimeError("agent is not attached to an AgentBus")
-        self._agent_bus.send_message(message)
-
-    def _on_bus_message(self, message: AgentMessage) -> None:
-        """Internal callback invoked by the AgentBus when a message addressed to this agent arrives."""
-        # Prevent duplicate processing of the same message
-        if message.id in self._processed_message_ids:
-            return
-
-        # mark as processed upfront to avoid re-entrancy loops
-        self._processed_message_ids.add(message.id)
-
-        try:
-            self.receive(message)
-        except Exception:
-            return
-
-        # Route to task handler or review depending on message type
-        try:
-            if message.message_type == MessageType.TASK or message.message_type == MessageType.QUESTION:
-                response = self.handle_task(message)
-            else:
-                response = self.review(message)
-        except Exception:
-            return
-
-        # If a response message was produced, publish it back on the bus
-        if response is not None and hasattr(self, "_agent_bus") and self._agent_bus:
-            # ensure response links to parent message to help traceability
-            if getattr(response, "parent_message_id", None) is None:
-                try:
-                    response.parent_message_id = message.id
-                except Exception:
-                    pass
-            try:
-                self._agent_bus.send_message(response)
+                requests.post(f"{api_url}/v1/event", json=payload, timeout=5)
             except Exception:
                 pass
+        threading.Thread(target=send, daemon=True).start()
+    def validate_message(self, message: AgentMessage) -> bool:
+        """Return whether ``message`` is a valid inbound message for this agent."""
+        return (
+            self._looks_like_message(message)
+            and message.receiver == self.name
+            and message.mission_id == self._bus.mission_id
+        )
 
-    def receive(self, message: AgentMessage) -> AgentMessage:
-        """Process an inbound message before task handling or review."""
-        if not self.validate_message(message):
-            raise ValueError("message must be an AgentMessage instance")
-        return message
+    def mark_processed(self, message_id: UUID) -> None:
+        """Record a message ID as processed in a thread-safe way."""
+        with self._lock:
+            self._processed_messages.add(message_id)
+
+    def has_processed(self, message_id: UUID) -> bool:
+        """Return whether a message ID has already been processed."""
+        with self._lock:
+            return message_id in self._processed_messages
+
+    def reset(self) -> None:
+        """Clear processed-message state and metadata.
+
+        The agent identity, creation timestamp, and bus registration are
+        preserved. This is useful for deterministic tests and mission-local
+        reuse where an agent should forget prior message state.
+        """
+        with self._lock:
+            self._processed_messages.clear()
+            self._metadata.clear()
+
+    def info(self) -> dict[str, Any]:
+        """Return JSON-safe identity and runtime information."""
+        with self._lock:
+            return {
+                "id": str(self._id),
+                "name": self._name,
+                "role": self._role,
+                "description": self._description,
+                "created_at": self._created_at.isoformat(),
+                "processed_messages": [str(message_id) for message_id in sorted(self._processed_messages)],
+                "metadata": deepcopy(self._metadata),
+            }
+
+    @staticmethod
+    def _normalize_text(value: str, field_name: str) -> str:
+        """Strip and validate required constructor text."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"{field_name} must be a non-empty string")
+        return normalized
+
+    @staticmethod
+    def _looks_like_message(message: object) -> bool:
+        """Return whether an object provides the required message interface."""
+        return all(
+            hasattr(message, attribute)
+            for attribute in ("id", "mission_id", "sender", "receiver", "message_type")
+        )
+
+    @staticmethod
+    def _message_type_matches(actual: object, expected: MessageType) -> bool:
+        """Return whether two message type representations are equivalent."""
+        return getattr(actual, "value", actual) == expected.value
 
 
-class ResearchAgent(BaseAgent):
-    """A simple research specialist agent that demonstrates the base contract."""
+class ExampleAgent(BaseAgent):
+    """Minimal concrete agent used to demonstrate the base contract."""
 
-    def __init__(self) -> None:
+    def __init__(self, bus: AgentBus) -> None:
         super().__init__(
-            name="Research",
-            role="Research Specialist",
-            description="Collects market and competitive intelligence for mission objectives.",
+            name="ExampleAgent",
+            role="Example Responder",
+            description="Demonstrates task handling with a simple response.",
+            bus=bus,
         )
         self._started = False
 
     def initialize(self) -> None:
+        """Mark the example agent as ready."""
         self._started = True
-        self.log("ResearchAgent initialized.")
 
     def can_handle(self, mission: Mission) -> bool:
-        return "research" in mission.objective.lower()
+        """Handle missions that include the example agent or mention examples."""
+        return self.name in mission.assigned_agents or "example" in mission.objective.lower()
 
-    def handle_task(self, message: AgentMessage) -> AgentMessage:
-        self.receive(message)
-        response = message.model_copy(deep=True, update={
-            "sender": self.name,
-            "receiver": message.sender,
-            "message_type": message.message_type,
-            "content": f"Research analysis for objective: {message.content}",
-            "confidence": 0.9,
-        })
-        return self.send(response)
+    def handle_task(self, message: AgentMessage) -> AgentMessage | None:
+        """Return a concise response to the sender of a task."""
+        return AgentMessage(
+            mission_id=message.mission_id,
+            sender=self.name,
+            receiver=message.sender,
+            message_type=MessageType.RESPONSE,
+            priority=Priority.MEDIUM,
+            content=f"ExampleAgent completed task: {message.content}",
+            confidence=0.95,
+            parent_message_id=message.id,
+        )
 
-    def review(self, message: AgentMessage) -> AgentMessage:
-        self.receive(message)
-        response = message.model_copy(deep=True, update={
-            "sender": self.name,
-            "receiver": message.sender,
-            "message_type": message.message_type,
-            "content": "Research review completed.",
-            "confidence": 0.95,
-        })
-        return self.send(response)
+    def review(self, message: AgentMessage) -> AgentMessage | None:
+        """Acknowledge reviewed artifacts without starting another workflow."""
+        return AgentMessage(
+            mission_id=message.mission_id,
+            sender=self.name,
+            receiver=message.sender,
+            message_type=MessageType.RESPONSE,
+            priority=Priority.LOW,
+            content=f"ExampleAgent reviewed message {message.id}.",
+            confidence=0.9,
+            parent_message_id=message.id,
+        )
 
-    def health(self) -> Dict[str, Any]:
+    def health(self) -> dict[str, Any]:
+        """Return example-agent readiness state."""
         return {
             "name": self.name,
-            "status": "healthy" if self._started else "initializing",
             "role": self.role,
+            "status": "healthy" if self._started else "initializing",
         }
 
     def shutdown(self) -> None:
+        """Mark the example agent as stopped."""
         self._started = False
-        self.log("ResearchAgent has shut down.")
 
 
 if __name__ == "__main__":
-    from uuid import uuid4
-
     mission = Mission(
-        title="Research AI startups in Europe for acquisition.",
-        objective="Research AI startups in Europe for acquisition.",
-        created_by="CEO",
+        title="Example agent task.",
+        objective="Demonstrate CEO to ExampleAgent task handling.",
+        assigned_agents=["ExampleAgent"],
+    )
+    conversation = MissionConversation.from_mission(mission)
+    bus = AgentBus(conversation=conversation)
+
+    def ceo_listener(message: AgentMessage) -> AgentMessage | None:
+        print("CEO received:", message.content)
+        return None
+
+    bus.register("CEO", ceo_listener)
+
+    agent = ExampleAgent(bus)
+    agent.initialize()
+
+    bus.send(
+        AgentMessage(
+            mission_id=mission.id,
+            sender="CEO",
+            receiver="ExampleAgent",
+            message_type=MessageType.TASK,
+            priority=Priority.HIGH,
+            content="Summarize the acquisition research workflow.",
+            requires_response=True,
+        )
     )
 
-    task_message = AgentMessage(
-        id=uuid4(),
-        mission_id=mission.id,
-        sender="CEO",
-        receiver="Research",
-        message_type=MessageType.TASK,
-        priority=Priority.HIGH,
-        content="Gather target evaluation criteria and identify risks.",
-        confidence=1.0,
-    )
-
-    research_agent = ResearchAgent()
-    research_agent.initialize()
-    if research_agent.can_handle(mission):
-        response = research_agent.handle_task(task_message)
-        print("Response message:", response.to_dict())
-        print("Health status:", research_agent.health())
-    research_agent.shutdown()
+    print("Agent info:", agent.info())
+    print("Conversation messages:", [message.summary() for message in bus.history()])
+    agent.shutdown()
