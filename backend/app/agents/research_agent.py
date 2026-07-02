@@ -249,16 +249,8 @@ The JSON values must be concise and factual.
 def run_research_agent(task: str) -> str:
     agent = ResearchAgent()
     agent.initialize()
-    response_message = agent.handle_task(
-        AgentMessage(
-            mission_id=uuid4(),
-            sender="CEO",
-            receiver="Research",
-            message_type=MessageType.TASK,
-            priority=Priority.HIGH,
-            content=task,
-            confidence=1.0,
-        )
-    )
-    agent.shutdown()
-    return response_message.content
+
+    try:
+        return agent._run_research_task(task)
+    finally:
+        agent.shutdown()
